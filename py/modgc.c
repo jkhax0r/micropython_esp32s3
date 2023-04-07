@@ -60,6 +60,24 @@ STATIC mp_obj_t gc_isenabled(void) {
 }
 MP_DEFINE_CONST_FUN_OBJ_0(gc_isenabled_obj, gc_isenabled);
 
+// mem_info(): return everything from gc_info() - this can be very long running so to avoid multiple calls...
+STATIC mp_obj_t gc_mem_info(void) {
+    gc_info_t info;
+    gc_info(&info);
+
+    return mp_obj_new_tuple(7, ((mp_obj_t []) {
+        MP_OBJ_NEW_SMALL_INT(info.total),
+        MP_OBJ_NEW_SMALL_INT(info.used),
+        MP_OBJ_NEW_SMALL_INT(info.free),
+        MP_OBJ_NEW_SMALL_INT(info.max_free * MICROPY_BYTES_PER_GC_BLOCK),
+        MP_OBJ_NEW_SMALL_INT(info.num_1block),
+        MP_OBJ_NEW_SMALL_INT(info.num_2block),
+        MP_OBJ_NEW_SMALL_INT(info.max_block * MICROPY_BYTES_PER_GC_BLOCK),
+
+    }));
+}
+MP_DEFINE_CONST_FUN_OBJ_0(gc_mem_info_obj, gc_mem_info);
+
 // mem_free(): return the number of bytes of available heap RAM
 STATIC mp_obj_t gc_mem_free(void) {
     gc_info_t info;
@@ -103,6 +121,7 @@ STATIC const mp_rom_map_elem_t mp_module_gc_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_isenabled), MP_ROM_PTR(&gc_isenabled_obj) },
     { MP_ROM_QSTR(MP_QSTR_mem_free), MP_ROM_PTR(&gc_mem_free_obj) },
     { MP_ROM_QSTR(MP_QSTR_mem_alloc), MP_ROM_PTR(&gc_mem_alloc_obj) },
+    { MP_ROM_QSTR(MP_QSTR_mem_info), MP_ROM_PTR(&gc_mem_info_obj) },
     #if MICROPY_GC_ALLOC_THRESHOLD
     { MP_ROM_QSTR(MP_QSTR_threshold), MP_ROM_PTR(&gc_threshold_obj) },
     #endif

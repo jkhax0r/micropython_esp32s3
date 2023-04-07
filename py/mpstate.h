@@ -85,6 +85,7 @@ typedef struct _mp_state_mem_area_t {
     #endif
     byte *gc_pool_start;
     byte *gc_pool_end;
+    uint32_t *gc_usedmap;               // Bitmap of used blocks - each bit represent 'gc_usedmap_blocks_per_bit' blocks
 
     size_t gc_last_free_atb_index;
     size_t gc_high_watermark; // The block ID of the highest block allocated in the area

@@ -32,6 +32,15 @@
 #include "py/gc.h"
 #include "py/runtime.h"
 
+// Seems MPY-CROSS build doesn't have this defined...
+#ifndef likely
+#define likely(x)      __builtin_expect(!!(x), 1)
+#endif
+
+#ifndef unlikely
+#define unlikely(x)    __builtin_expect(!!(x), 0)
+#endif
+
 #if MICROPY_DEBUG_VALGRIND
 #include <valgrind/memcheck.h>
 #endif
@@ -120,6 +129,21 @@
 #define GC_EXIT()
 #endif
 
+// This will create a sort of cached lookup of ranges of free garbage collector blocks - we call it the usedmap - which will let
+// the sweep routines quickly skip over full ranges of blocks that are known to be free.  This has drastic speed improvements on
+// systems with large unused SPIRAM (and should on any system) to avoid having to check each block is free.
+// It should also help in these cases when there's moderate fragmentation to keep the speed relatively constant for a given memory
+// usage-level, even when slightly fragmented.  A lower blocks per bit will result in more RAM, the scanning will take slighly longer,
+// but fragmentation will become less of a factor.
+//
+// Memory required is relative to heap size ::: mem_required = total_heap_size / (MICROPY_GC_USEDMAP_BLOCKS_PER_BIT * 8 * BYTES_PER_BLOCK)
+//
+// This need not be a power of 2
+//
+#if !MICROPY_GC_USEDMAP_BLOCKS_PER_BIT
+#define MICROPY_GC_USEDMAP_BLOCKS_PER_BIT 32
+#endif
+
 // TODO waste less memory; currently requires that all entries in alloc_table have a corresponding block in pool
 STATIC void gc_setup_area(mp_state_mem_area_t *area, void *start, void *end) {
     // calculate parameters for GC (T=total, A=alloc table, F=finaliser table, P=pool; all in bytes):
@@ -127,7 +151,24 @@ STATIC void gc_setup_area(mp_state_mem_area_t *area, void *start, void *end) {
     //     F = A * BLOCKS_PER_ATB / BLOCKS_PER_FTB
     //     P = A * BLOCKS_PER_ATB * BYTES_PER_BLOCK
     // => T = A * (1 + BLOCKS_PER_ATB / BLOCKS_PER_FTB + BLOCKS_PER_ATB * BYTES_PER_BLOCK)
+
+
     size_t total_byte_len = (byte *)end - (byte *)start;
+
+    //TODO: we have some of our usedmap calculated over the ATB, finalizer, and the usedmap itself, but should be small enough to not matter...
+    //      risky to change and hurts my head to try to calculate out the nominal solution besides to just use a separate malloc.
+    // Round up each step of the way to make sure have more bits than we need
+    const size_t total_block_cnt = (total_byte_len + BYTES_PER_BLOCK - 1) / BYTES_PER_BLOCK;
+    const size_t usedmap_bit_cnt = (total_block_cnt + MICROPY_GC_USEDMAP_BLOCKS_PER_BIT - 1) / MICROPY_GC_USEDMAP_BLOCKS_PER_BIT;
+    const size_t usedmap_word_cnt = (usedmap_bit_cnt + 31) / 32;
+    const size_t usedmap_total_size = usedmap_word_cnt * sizeof(uint32_t);
+
+    area->gc_usedmap = (uint32_t *)start;
+    memset(area->gc_usedmap, 0, usedmap_total_size);
+    start = ((byte *)start) + usedmap_total_size;
+
+
+    total_byte_len = (byte *)end - (byte *)start;
     #if MICROPY_ENABLE_FINALISER
     area->gc_alloc_table_byte_len = (total_byte_len - ALLOC_TABLE_GAP_BYTE) * MP_BITS_PER_BYTE / (MP_BITS_PER_BYTE + MP_BITS_PER_BYTE * BLOCKS_PER_ATB / BLOCKS_PER_FTB + MP_BITS_PER_BYTE * BLOCKS_PER_ATB * BYTES_PER_BLOCK);
     #else
@@ -303,6 +344,8 @@ STATIC void gc_mark_subtree(size_t block)
 
         // check this block's children
         void **ptrs = (void **)PTR_FROM_BLOCK(area, block);
+
+        #pragma GCC unroll 4    // 4 blocks per page, may help
         for (size_t i = n_blocks * BYTES_PER_BLOCK / sizeof(void *); i > 0; i--, ptrs++) {
             MICROPY_GC_HOOK_LOOP
             void *ptr = *ptrs;
@@ -321,14 +364,14 @@ STATIC void gc_mark_subtree(size_t block)
             mp_state_mem_area_t *ptr_area = area;
             #endif
             size_t ptr_block = BLOCK_FROM_PTR(ptr_area, ptr);
-            if (ATB_GET_KIND(ptr_area, ptr_block) != AT_HEAD) {
+            if (likely(ATB_GET_KIND(ptr_area, ptr_block) != AT_HEAD)) {
                 // This block is already marked.
                 continue;
             }
             // An unmarked head. Mark it, and push it on gc stack.
             TRACE_MARK(ptr_block, ptr);
             ATB_HEAD_TO_MARK(ptr_area, ptr_block);
-            if (sp < MICROPY_ALLOC_GC_STACK_SIZE) {
+            if (likely(sp < MICROPY_ALLOC_GC_STACK_SIZE)) {
                 MP_STATE_MEM(gc_block_stack)[sp] = ptr_block;
                 #if MICROPY_GC_SPLIT_HEAP
                 MP_STATE_MEM(gc_area_stack)[sp] = ptr_area;
@@ -359,15 +402,37 @@ STATIC void gc_deal_with_stack_overflow(void) {
 
         // scan entire memory looking for blocks which have been marked but not their children
         for (mp_state_mem_area_t *area = &MP_STATE_MEM(area); area != NULL; area = NEXT_AREA(area)) {
-            for (size_t block = 0; block < area->gc_alloc_table_byte_len * BLOCKS_PER_ATB; block++) {
-                MICROPY_GC_HOOK_LOOP
-                // trace (again) if mark bit set
-                if (ATB_GET_KIND(area, block) == AT_MARK) {
-                    #if MICROPY_GC_SPLIT_HEAP
-                    gc_mark_subtree(area, block);
-                    #else
-                    gc_mark_subtree(block);
-                    #endif
+
+            size_t end_block = area->gc_alloc_table_byte_len * BLOCKS_PER_ATB;
+            if (area->gc_high_watermark < end_block) {
+                end_block = area->gc_high_watermark + 1;
+            }
+
+            const size_t usedmap_blocks_per_bit = MICROPY_GC_USEDMAP_BLOCKS_PER_BIT;
+            const size_t usedmap_bit_cnt = (end_block + usedmap_blocks_per_bit - 1) / usedmap_blocks_per_bit;
+            const size_t usedmap_word_cnt = (usedmap_bit_cnt + 31) / 32;
+            for (size_t usedmap_ndx = 0; usedmap_ndx < usedmap_word_cnt; usedmap_ndx++) {
+                if (likely(!area->gc_usedmap[usedmap_ndx])) continue;  // quick exit
+
+                for (size_t usedmap_bit_ndx = 0; usedmap_bit_ndx < 32; usedmap_bit_ndx++) {
+                    if (likely(!(area->gc_usedmap[usedmap_ndx] & (1UL << usedmap_bit_ndx)))) continue;       // quick exit
+
+                    const size_t block_loop_start = (usedmap_ndx * 32 + usedmap_bit_ndx) * usedmap_blocks_per_bit;
+                    size_t block_loop_end = block_loop_start + usedmap_blocks_per_bit;
+                    if (block_loop_end > end_block) block_loop_end = end_block;
+
+                    #pragma GCC unroll 4        // Seems to save about 4% cpu here - likely the SPIRAM is reading all at once or something?
+                    for (size_t block = block_loop_start; block < block_loop_end; block++) {
+                        MICROPY_GC_HOOK_LOOP
+                        // trace (again) if mark bit set
+                        if (unlikely(ATB_GET_KIND(area, block) == AT_MARK)) {
+                            #if MICROPY_GC_SPLIT_HEAP
+                            gc_mark_subtree(area, block);
+                            #else
+                            gc_mark_subtree(block);
+                            #endif
+                        }
+                    }
                 }
             }
         }
@@ -388,58 +453,82 @@ STATIC void gc_sweep(void) {
 
         size_t last_block = 0;
 
-        for (size_t block = 0; block < end_block; block++) {
-            MICROPY_GC_HOOK_LOOP
-            switch (ATB_GET_KIND(area, block)) {
-                case AT_HEAD:
-                    #if MICROPY_ENABLE_FINALISER
-                    if (FTB_GET(area, block)) {
-                        mp_obj_base_t *obj = (mp_obj_base_t *)PTR_FROM_BLOCK(area, block);
-                        if (obj->type != NULL) {
-                            // if the object has a type then see if it has a __del__ method
-                            mp_obj_t dest[2];
-                            mp_load_method_maybe(MP_OBJ_FROM_PTR(obj), MP_QSTR___del__, dest);
-                            if (dest[0] != MP_OBJ_NULL) {
-                                // load_method returned a method, execute it in a protected environment
-                                #if MICROPY_ENABLE_SCHEDULER
-                                mp_sched_lock();
-                                #endif
-                                mp_call_function_1_protected(dest[0], dest[1]);
-                                #if MICROPY_ENABLE_SCHEDULER
-                                mp_sched_unlock();
-                                #endif
-                            }
-                        }
-                        // clear finaliser flag
-                        FTB_CLEAR(area, block);
-                    }
-                    #endif
-                    free_tail = 1;
-                    DEBUG_printf("gc_sweep(%p)\n", (void *)PTR_FROM_BLOCK(area, block));
-                    #if MICROPY_PY_GC_COLLECT_RETVAL
-                    MP_STATE_MEM(gc_collected)++;
-                    #endif
-                    // fall through to free the head
-                    MP_FALLTHROUGH
+        const size_t usedmap_blocks_per_bit = MICROPY_GC_USEDMAP_BLOCKS_PER_BIT;
+        const size_t usedmap_bit_cnt = (end_block + usedmap_blocks_per_bit - 1) / usedmap_blocks_per_bit;
+        const size_t usedmap_word_cnt = (usedmap_bit_cnt + 31) / 32;
 
-                case AT_TAIL:
-                    if (free_tail) {
+	    for (size_t usedmap_ndx = 0; usedmap_ndx < usedmap_word_cnt; usedmap_ndx++) {
+            if (likely(!area->gc_usedmap[usedmap_ndx])) continue;  // quick loop with no bits set
+
+            size_t usedmap_new = 0;
+            for (size_t usedmap_bit_ndx = 0; usedmap_bit_ndx < 32; usedmap_bit_ndx++) {
+                size_t usedmap_bit_mask = (1UL << usedmap_bit_ndx);
+                if (likely(!(area->gc_usedmap[usedmap_ndx] & usedmap_bit_mask))) continue;
+
+                const size_t block_loop_start = (usedmap_ndx * 32 + usedmap_bit_ndx) * usedmap_blocks_per_bit;
+                size_t block_loop_end = block_loop_start + usedmap_blocks_per_bit;
+                if (block_loop_end > end_block) block_loop_end = end_block;
+
+                #pragma GCC unroll 4        // Seems to save about 4% cpu here - likely the SPIRAM is reading all at once or something?
+                for (size_t block = block_loop_start; block < block_loop_end; block++) {
+                    MICROPY_GC_HOOK_LOOP
+
+                    uint atb = ATB_GET_KIND(area, block);
+                    if (likely(atb == AT_FREE)) continue;       // most likely quick exit
+
+                    if (likely(atb == AT_MARK)) {
+                        ATB_MARK_TO_HEAD(area, block);
+                        free_tail = 0;
+                        last_block = block;
+                        usedmap_new |= usedmap_bit_mask;
+                    } else if (atb == AT_HEAD) {
+                        #if MICROPY_ENABLE_FINALISER
+                        if (FTB_GET(area, block)) {
+                            mp_obj_base_t *obj = (mp_obj_base_t *)PTR_FROM_BLOCK(area, block);
+                            if (obj->type != NULL) {
+                                // if the object has a type then see if it has a __del__ method
+                                mp_obj_t dest[2];
+                                mp_load_method_maybe(MP_OBJ_FROM_PTR(obj), MP_QSTR___del__, dest);
+                                if (dest[0] != MP_OBJ_NULL) {
+                                    // load_method returned a method, execute it in a protected environment
+                                    #if MICROPY_ENABLE_SCHEDULER
+                                    mp_sched_lock();
+                                    #endif
+                                    mp_call_function_1_protected(dest[0], dest[1]);
+                                    #if MICROPY_ENABLE_SCHEDULER
+                                    mp_sched_unlock();
+                                    #endif
+                                }
+                            }
+                            // clear finaliser flag
+                            FTB_CLEAR(area, block);
+                        }
+                        #endif
+                        free_tail = 1;
+                        DEBUG_printf("gc_sweep(%p)\n", (void *)PTR_FROM_BLOCK(area, block));
+                        #if MICROPY_PY_GC_COLLECT_RETVAL
+                        MP_STATE_MEM(gc_collected)++;
+                        #endif
+
                         ATB_ANY_TO_FREE(area, block);
                         #if CLEAR_ON_SWEEP
                         memset((void *)PTR_FROM_BLOCK(area, block), 0, BYTES_PER_BLOCK);
                         #endif
+                    } else {
+                        if (free_tail) {
+                            ATB_ANY_TO_FREE(area, block);
+                            #if CLEAR_ON_SWEEP
+                            memset((void *)PTR_FROM_BLOCK(area, block), 0, BYTES_PER_BLOCK);
+                            #endif
+                        } else {
+                            usedmap_new |= usedmap_bit_mask;
+                            last_block = block;
+                        }
                     }
-                    last_block = block;
-                    break;
-
-                case AT_MARK:
-                    ATB_MARK_TO_HEAD(area, block);
-                    free_tail = 0;
-                    last_block = block;
-                    break;
+                }
             }
+            area->gc_usedmap[usedmap_ndx] = usedmap_new;
         }
-
         area->gc_high_watermark = last_block;
     }
 }
@@ -500,7 +589,7 @@ void gc_collect_root(void **ptrs, size_t len) {
         }
         #endif
         size_t block = BLOCK_FROM_PTR(area, ptr);
-        if (ATB_GET_KIND(area, block) == AT_HEAD) {
+        if (unlikely(ATB_GET_KIND(area, block) == AT_HEAD)) {
             // An unmarked head: mark it, and mark all its children
             ATB_HEAD_TO_MARK(area, block);
             #if MICROPY_GC_SPLIT_HEAP
@@ -532,7 +621,9 @@ void gc_sweep_all(void) {
     gc_collect_end();
 }
 
-void gc_info(gc_info_t *info) {
+//#define TEST_OLD_GC_INFO
+#ifdef TEST_OLD_GC_INFO
+IRAM_ATTR void gc_info_old(gc_info_t *info) {
     GC_ENTER();
     info->total = 0;
     info->used = 0;
@@ -598,6 +689,156 @@ void gc_info(gc_info_t *info) {
     info->free *= BYTES_PER_BLOCK;
     GC_EXIT();
 }
+#endif
+
+static void gc_info_end_of_sequence(gc_info_t *info, size_t len)
+{
+    if (len == 1) {
+        info->num_1block += 1;
+    } else if (len == 2) {
+        info->num_2block += 1;
+    }
+    if (len > info->max_block) {
+        info->max_block = len;
+    }
+}
+
+void gc_info(gc_info_t *info) {
+    info->total = 0;
+    info->used = 0;
+    info->free = 0;
+    info->max_free = 0;
+    info->num_1block = 0;
+    info->num_2block = 0;
+    info->max_block = 0;
+
+    GC_ENTER();
+
+    #ifdef TEST_OLD_GC_INFO
+    gc_info_t info2;
+    size_t t1 = tick();
+    gc_info_old(&info2);
+    size_t t2 = tick();
+    #endif
+
+    // scan entire memory looking for blocks which have been marked but not their children
+    for (mp_state_mem_area_t *area = &MP_STATE_MEM(area); area != NULL; area = NEXT_AREA(area)) {
+
+        info->total += area->gc_pool_end - area->gc_pool_start;
+
+        size_t end_block = area->gc_alloc_table_byte_len * BLOCKS_PER_ATB;
+        if (area->gc_high_watermark < end_block) {
+            end_block = area->gc_high_watermark + 1;
+        }
+
+        const size_t usedmap_blocks_per_bit = MICROPY_GC_USEDMAP_BLOCKS_PER_BIT;
+        const size_t usedmap_bit_cnt = (end_block + usedmap_blocks_per_bit - 1) / usedmap_blocks_per_bit;
+        const size_t usedmap_word_cnt = (usedmap_bit_cnt + 31) / 32;
+
+        size_t last_atb = AT_FREE;
+        size_t len = 0;
+        size_t len_free = 0;
+        for (size_t usedmap_ndx = 0; usedmap_ndx < usedmap_word_cnt; usedmap_ndx++) {
+
+            // //All free quick exit path... sigh, a bit more complex here
+            if (likely(!area->gc_usedmap[usedmap_ndx])) {
+                if (last_atb != AT_FREE) gc_info_end_of_sequence(info, len);
+                last_atb = AT_FREE;
+                info->free += 32 * usedmap_blocks_per_bit;
+                len_free += 32 * usedmap_blocks_per_bit;
+                len = 0;
+                continue;
+            }
+
+            for (uint32_t usedmap_bit_ndx = 0; usedmap_bit_ndx < 32; usedmap_bit_ndx++) {
+
+                // //All free quick exit path... sigh, a bit more complex here
+                if (likely(!(area->gc_usedmap[usedmap_ndx] & (1ULL << usedmap_bit_ndx)))) {
+                    if (last_atb != AT_FREE) gc_info_end_of_sequence(info, len);
+                    last_atb = AT_FREE;
+                    info->free += usedmap_blocks_per_bit;
+                    len_free += usedmap_blocks_per_bit;
+                    len = 0;
+                    continue;
+                }
+
+                const size_t block_loop_start = (usedmap_ndx * 32 + usedmap_bit_ndx) * usedmap_blocks_per_bit;
+                size_t block_loop_end = block_loop_start + usedmap_blocks_per_bit;
+                if (block_loop_end > end_block) block_loop_end = end_block;
+
+                for (size_t block = block_loop_start; block < block_loop_end; block++) {
+                    MICROPY_GC_HOOK_LOOP
+                    size_t kind = ATB_GET_KIND(area, block);
+                    if (likely(kind == AT_FREE)) {          // assume memory is more often < 50%... it will be in the large SPIRAM cases where speed matters most anyway...
+                        if (last_atb != AT_FREE) gc_info_end_of_sequence(info, len);
+                        last_atb = AT_FREE;
+                        info->free += 1;
+                        len_free += 1;
+                        len = 0;
+                    } else if (kind == AT_HEAD) {
+                        if (last_atb != AT_FREE) gc_info_end_of_sequence(info, len);
+                        last_atb = AT_HEAD;
+                        info->used += 1;
+                        len = 1;
+
+                        if (len_free > info->max_free) {
+                            info->max_free = len_free;
+                        }
+                        len_free = 0;
+                    } else {        // will cover MARK too, but that's a bug
+                        assert(last_atb == AT_HEAD || last_atb == AT_FREE);
+                        last_atb = AT_TAIL;
+                        info->used += 1;
+                        len += 1;
+                    }
+                }
+            }
+        }
+
+        // Finish any trailing blocks skipped by assuming all the rest are AT_FREE
+        if (last_atb != AT_FREE) gc_info_end_of_sequence(info, len);
+        size_t checked_blocks = usedmap_word_cnt * 32 * usedmap_blocks_per_bit;
+        size_t skipped_blocks = area->gc_alloc_table_byte_len * BLOCKS_PER_ATB - checked_blocks;
+        len_free += skipped_blocks;
+        info->free += skipped_blocks;
+
+        if (len_free > info->max_free) {
+            info->max_free = len_free;
+        }
+    }
+
+    info->used *= BYTES_PER_BLOCK;
+    info->free *= BYTES_PER_BLOCK;
+    GC_EXIT();
+
+    #ifdef TEST_OLD_GC_INFO
+    // Some benchmarks... WOW!!...
+    // ESP32S3 use case with 8MB SPIRAM and about ~170KB used
+    // gc_info() old is 77.7ms
+    // gc_info() new is 1.53ms!
+    // gc_info() new, but with full iterations is 24.4ms.  So this was with commented out the gc_high_watermark, and the quick usedmap_ndx "continue" exits.  So basically just code refactor/optimizations last_atb to remove the extra forward check, and AT_FREE likely first)
+    size_t t3 = tick();
+    printf("gc_info() old = " UINT_FMT "us, new = " UINT_FMT "us\n", t2 - t1, t3 - t2);
+    if (info->total != info2.total) {
+        printf("total mismatch " UINT_FMT " != " UINT_FMT "\n", info->total, info2.total);
+    }
+    if (info->used != info2.used) {
+        printf("used mismatch " UINT_FMT " != " UINT_FMT "\n", info->used, info2.used);
+    }
+    if (info->max_free != info2.max_free) {
+        printf("max_free mismatch " UINT_FMT " != " UINT_FMT "\n", info->max_free, info2.max_free);
+    }
+    if (info->num_1block != info2.num_1block) {
+        printf("num_1block mismatch " UINT_FMT " != " UINT_FMT "\n", info->num_1block, info2.num_1block);
+    }
+    if (info->num_2block != info2.num_2block) {
+        printf("num_2block mismatch " UINT_FMT " != " UINT_FMT "\n", info->num_2block, info2.num_2block);
+    }
+    if (info->max_block != info2.max_block) {
+        printf("max_block mismatch " UINT_FMT " != " UINT_FMT "\n", info->max_block, info2.max_block);
+    }
+    #endif
+}
 
 void *gc_alloc(size_t n_bytes, unsigned int alloc_flags) {
     bool has_finaliser = alloc_flags & GC_ALLOC_FLAG_HAS_FINALISER;
@@ -643,6 +884,8 @@ void *gc_alloc(size_t n_bytes, unsigned int alloc_flags) {
         // look for a run of n_blocks available blocks
         for (; area != NULL; area = NEXT_AREA(area), i = 0) {
             n_free = 0;
+            
+            #pragma GCC unroll 4    // 4 blocks per page, may help
             for (i = area->gc_last_free_atb_index; i < area->gc_alloc_table_byte_len; i++) {
                 byte a = area->gc_alloc_table_start[i];
                 // *FORMAT-OFF*
@@ -692,6 +935,10 @@ found:
         area->gc_last_free_atb_index = (i + 1) / BLOCKS_PER_ATB;
     }
 
+    for (size_t b = start_block / MICROPY_GC_USEDMAP_BLOCKS_PER_BIT; b <= end_block / MICROPY_GC_USEDMAP_BLOCKS_PER_BIT; b++) {
+        area->gc_usedmap[b / 32] |= (1UL << (b % 32));
+    }
+
     if (area->gc_high_watermark < end_block) {
         area->gc_high_watermark = end_block;
     }
@@ -700,7 +947,7 @@ found:
     ATB_FREE_TO_HEAD(area, start_block);
 
     // mark rest of blocks as used tail
-    // TODO for a run of many blocks can make this more efficient
+    #pragma GCC unroll 8    // 8 blocks per page, shouldn't hurt and a small loop
     for (size_t bl = start_block + 1; bl <= end_block; bl++) {
         ATB_FREE_TO_TAIL(area, bl);
     }
@@ -814,6 +1061,7 @@ void gc_free(void *ptr) {
     }
 
     // free head and all of its tail blocks
+    #pragma GCC unroll 4    // 4 blocks per page, may help
     do {
         ATB_ANY_TO_FREE(area, block);
         block += 1;
@@ -845,6 +1093,7 @@ size_t gc_nbytes(const void *ptr) {
         if (ATB_GET_KIND(area, block) == AT_HEAD) {
             // work out number of consecutive blocks in the chain starting with this on
             size_t n_blocks = 0;
+            #pragma GCC unroll 4    // 4 blocks per page, may help
             do {
                 n_blocks += 1;
             } while (ATB_GET_KIND(area, block + n_blocks) == AT_TAIL);
@@ -931,6 +1180,8 @@ void *gc_realloc(void *ptr_in, size_t n_bytes, bool allow_move) {
     size_t n_free = 0;
     size_t n_blocks = 1; // counting HEAD block
     size_t max_block = area->gc_alloc_table_byte_len * BLOCKS_PER_ATB;
+    
+    #pragma GCC unroll 4    // 4 blocks per page, may help
     for (size_t bl = block + n_blocks; bl < max_block; bl++) {
         byte block_type = ATB_GET_KIND(area, bl);
         if (block_type == AT_TAIL) {
@@ -957,6 +1208,8 @@ void *gc_realloc(void *ptr_in, size_t n_bytes, bool allow_move) {
     // check if we can shrink the allocated area
     if (new_blocks < n_blocks) {
         // free unneeded tail blocks
+        
+        #pragma GCC unroll 4    // 4 blocks per page, may help
         for (size_t bl = block + new_blocks, count = n_blocks - new_blocks; count > 0; bl++, count--) {
             ATB_ANY_TO_FREE(area, bl);
         }
@@ -986,9 +1239,15 @@ void *gc_realloc(void *ptr_in, size_t n_bytes, bool allow_move) {
     if (new_blocks <= n_blocks + n_free) {
         // mark few more blocks as used tail
         size_t end_block = block + new_blocks;
+        
+        #pragma GCC unroll 4    // 4 blocks per page, may help
         for (size_t bl = block + n_blocks; bl < end_block; bl++) {
             assert(ATB_GET_KIND(area, bl) == AT_FREE);
             ATB_FREE_TO_TAIL(area, bl);
+        }
+
+        for (size_t b = (block + n_blocks) / MICROPY_GC_USEDMAP_BLOCKS_PER_BIT; b < end_block / MICROPY_GC_USEDMAP_BLOCKS_PER_BIT; b++) {
+            area->gc_usedmap[b / 32] |= (1UL << (b % 32));
         }
 
         if (area->gc_high_watermark < end_block) {
