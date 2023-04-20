@@ -865,7 +865,7 @@ int mp_bluetooth_gap_set_device_name(const uint8_t *buf, size_t len) {
     return mp_bluetooth_gatts_db_write(MP_STATE_PORT(bluetooth_btstack_root_pointers)->gatts_db, BTSTACK_GAP_DEVICE_NAME_HANDLE, buf, len);
 }
 
-int mp_bluetooth_gap_advertise_start(bool connectable, int32_t interval_us, const uint8_t *adv_data, size_t adv_data_len, const uint8_t *sr_data, size_t sr_data_len) {
+int mp_bluetooth_gap_advertise_start(bool connectable, int32_t interval_us, uint8_t filter_policy, const uint8_t *adv_data, size_t adv_data_len, const uint8_t *sr_data, size_t sr_data_len) {
     DEBUG_printf("mp_bluetooth_gap_advertise_start\n");
 
     if (!mp_bluetooth_is_active()) {
@@ -879,7 +879,7 @@ int mp_bluetooth_gap_advertise_start(bool connectable, int32_t interval_us, cons
 
     uint8_t direct_address_type = 0;
     uint8_t channel_map = 0x07; // Use all three broadcast channels.
-    uint8_t filter_policy = 0x00; // None.
+    uint8_t filter_policy = filter_policy;
 
     gap_advertisements_set_params(adv_int_min, adv_int_max, adv_type, direct_address_type, null_addr, channel_map, filter_policy);
 

@@ -167,6 +167,22 @@
 #define MP_BLUETOOTH_ADDRESS_MODE_RPA (2)
 #define MP_BLUETOOTH_ADDRESS_MODE_NRPA (3)
 
+/*
+ * Advertising filter policy
+ *
+ * Determines how an advertiser filters scan and connection requests.
+ *
+ *  NONE: no filtering (default value). No whitelist used.
+ *  SCAN: process all connection requests but only scans from white list.
+ *  CONN: process all scan request but only connection requests from white list
+ *  BOTH: ignore all scan and connection requests unless in white list.
+ */
+#define MP_BLUETOOTH_ADV_FILTER_POLICY_NONE            (0)
+#define MP_BLUETOOTH_ADV_FILTER_POLICY_SCAN            (1)
+#define MP_BLUETOOTH_ADV_FILTER_POLICY_CONN            (2)
+#define MP_BLUETOOTH_ADV_FILTER_POLICY_BOTH            (3)
+#define MP_BLUETOOTH_ADV_FILTER_POLICY_MAX             (3)
+
 // These match the spec values, can be used directly by the stack.
 #define MP_BLUETOOTH_IO_CAPABILITY_DISPLAY_ONLY        (0)
 #define MP_BLUETOOTH_IO_CAPABILITY_DISPLAY_YESNO       (1)
@@ -319,7 +335,7 @@ int mp_bluetooth_gap_set_device_name(const uint8_t *buf, size_t len);
 
 // Start advertisement. Will re-start advertisement when already enabled.
 // Returns errno on failure.
-int mp_bluetooth_gap_advertise_start(bool connectable, int32_t interval_us, const uint8_t *adv_data, size_t adv_data_len, const uint8_t *sr_data, size_t sr_data_len);
+int mp_bluetooth_gap_advertise_start(bool connectable, int32_t interval_us, uint8_t filter_policy, const uint8_t *adv_data, size_t adv_data_len, const uint8_t *sr_data, size_t sr_data_len);
 
 // Stop advertisement. No-op when already stopped.
 void mp_bluetooth_gap_advertise_stop(void);

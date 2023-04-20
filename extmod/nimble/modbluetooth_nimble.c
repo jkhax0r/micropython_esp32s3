@@ -797,7 +797,7 @@ int mp_bluetooth_gap_set_device_name(const uint8_t *buf, size_t len) {
     return ble_hs_err_to_errno(ble_svc_gap_device_name_set(tmp_buf));
 }
 
-int mp_bluetooth_gap_advertise_start(bool connectable, int32_t interval_us, const uint8_t *adv_data, size_t adv_data_len, const uint8_t *sr_data, size_t sr_data_len) {
+int mp_bluetooth_gap_advertise_start(bool connectable, int32_t interval_us, uint8_t filter_policy, const uint8_t *adv_data, size_t adv_data_len, const uint8_t *sr_data, size_t sr_data_len) {
     if (!mp_bluetooth_is_active()) {
         return ERRNO_BLUETOOTH_NOT_ACTIVE;
     }
@@ -825,6 +825,7 @@ int mp_bluetooth_gap_advertise_start(bool connectable, int32_t interval_us, cons
         .itvl_min = interval_us / BLE_HCI_ADV_ITVL, // convert to 625us units.
         .itvl_max = interval_us / BLE_HCI_ADV_ITVL,
         .channel_map = 7, // all 3 channels.
+        .filter_policy = filter_policy,
     };
 
     ret = ble_gap_adv_start(nimble_address_mode, NULL, BLE_HS_FOREVER, &adv_params, central_gap_event_cb, NULL);

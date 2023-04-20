@@ -225,7 +225,7 @@ STATIC void mp_bluetooth_prepare_bt_data(const uint8_t *data, size_t len, struct
     *bt_len = i;
 }
 
-int mp_bluetooth_gap_advertise_start(bool connectable, int32_t interval_us, const uint8_t *adv_data, size_t adv_data_len, const uint8_t *sr_data, size_t sr_data_len) {
+int mp_bluetooth_gap_advertise_start(bool connectable, int32_t interval_us, uint8_t filter_policy, const uint8_t *adv_data, size_t adv_data_len, const uint8_t *sr_data, size_t sr_data_len) {
     if (!mp_bluetooth_is_active()) {
         return ERRNO_BLUETOOTH_NOT_ACTIVE;
     }
@@ -251,6 +251,8 @@ int mp_bluetooth_gap_advertise_start(bool connectable, int32_t interval_us, cons
         .sid = 0,
         .secondary_max_skip = 0,
         .options = (connectable ? BT_LE_ADV_OPT_CONNECTABLE : 0)
+            | ((filter_policy & MP_BLUETOOTH_ADV_FILTER_POLICY_SCAN) ? BT_LE_ADV_OPT_FILTER_SCAN_REQ : 0)
+            | ((filter_policy & MP_BLUETOOTH_ADV_FILTER_POLICY_CONN) ? BT_LE_ADV_OPT_FILTER_CONN : 0)
             | BT_LE_ADV_OPT_ONE_TIME
             | BT_LE_ADV_OPT_USE_IDENTITY
             | BT_LE_ADV_OPT_SCANNABLE,
